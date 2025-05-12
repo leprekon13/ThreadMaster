@@ -9,19 +9,26 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
     private final long keepAliveTime;
     private final TimeUnit timeUnit;
     private final int queueSize;
-    private final BlockingQueue<Runnable> taskQueue;
+    private final int minSpareThreads;
+    private final BlockingQueue<Runnable>[] taskQueues;
     private final AtomicInteger currentPoolSize = new AtomicInteger(0);
+    private final AtomicInteger queueIndex = new AtomicInteger(0);
     private final ThreadFactory threadFactory;
-    private boolean isShutdown = false;
+    private volatile boolean isShutdown = false;
 
-    public CustomThreadPoolExecutor(int corePoolSize, int maxPoolSize, long keepAliveTime, TimeUnit timeUnit, int queueSize) {
+    @SuppressWarnings("unchecked")
+    public CustomThreadPoolExecutor(int corePoolSize, int maxPoolSize, long keepAliveTime, TimeUnit timeUnit, int queueSize, int minSpareThreads, int numQueues) {
         this.corePoolSize = corePoolSize;
         this.maxPoolSize = maxPoolSize;
         this.keepAliveTime = keepAliveTime;
         this.timeUnit = timeUnit;
         this.queueSize = queueSize;
-        this.taskQueue = new LinkedBlockingQueue<>(queueSize);
-        this.threadFactory = Executors.defaultThreadFactory();
+        this.minSpareThreads = minSpareThreads;
+        this.taskQueues = new BlockingQueue[numQueues];
+        for (int i = 0; i < numQueues; i++) {
+            this.taskQueues[i] = new LinkedBlockingQueue<>(queueSize);
+        }
+        this.threadFactory = new CustomThreadFactory("MyPool");
     }
 
     @Override
@@ -29,8 +36,9 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
         if (isShutdown) {
             throw new RejectedExecutionException("Пул потоков закрыт. Новые задачи не принимаются.");
         }
-        if (!taskQueue.offer(command)) {
-            System.out.println("[Отклонено] Задача была отклонена из-за перегрузки!");
+        int index = queueIndex.getAndUpdate(i -> (i + 1) % taskQueues.length);
+        if (!taskQueues[index].offer(command)) {
+            handleTaskRejection(command);
         } else {
             manageThreads();
         }
@@ -51,11 +59,15 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
     @Override
     public void shutdownNow() {
         isShutdown = true;
-        taskQueue.clear();
+        for (BlockingQueue<Runnable> queue : taskQueues) {
+            queue.clear();
+        }
     }
 
     private synchronized void manageThreads() {
-        if (currentPoolSize.get() < corePoolSize || (currentPoolSize.get() < maxPoolSize && !taskQueue.isEmpty())) {
+        if (currentPoolSize.get() < corePoolSize
+                || (currentPoolSize.get() < maxPoolSize && !allQueuesEmpty())
+                || (currentPoolSize.get() - activeThreads() < minSpareThreads)) {
             Thread worker = threadFactory.newThread(this::workerTask);
             worker.start();
             currentPoolSize.incrementAndGet();
@@ -64,8 +76,8 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
 
     private void workerTask() {
         try {
-            while (!isShutdown || !taskQueue.isEmpty()) {
-                Runnable task = taskQueue.poll(keepAliveTime, timeUnit);
+            while (!isShutdown || !allQueuesEmpty()) {
+                Runnable task = pollFromQueues();
                 if (task != null) {
                     task.run();
                 } else if (currentPoolSize.get() > corePoolSize) {
@@ -77,5 +89,40 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
         } finally {
             currentPoolSize.decrementAndGet();
         }
+    }
+
+    private Runnable pollFromQueues() throws InterruptedException {
+        for (BlockingQueue<Runnable> queue : taskQueues) {
+            Runnable task = queue.poll(keepAliveTime, timeUnit);
+            if (task != null) {
+                return task;
+            }
+        }
+        return null;
+    }
+
+    private boolean allQueuesEmpty() {
+        for (BlockingQueue<Runnable> queue : taskQueues) {
+            if (!queue.isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int activeThreads() {
+        return currentPoolSize.get() - (int) totalQueueCapacity();
+    }
+
+    private int totalQueueCapacity() {
+        int totalCapacity = 0;
+        for (BlockingQueue<Runnable> queue : taskQueues) {
+            totalCapacity += queue.remainingCapacity();
+        }
+        return totalCapacity;
+    }
+
+    private void handleTaskRejection(Runnable command) {
+        System.out.println("[Отклонено] Задача была отклонена из-за перегрузки!");
     }
 }
