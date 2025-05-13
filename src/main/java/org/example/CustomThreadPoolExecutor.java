@@ -1,9 +1,13 @@
 package org.example;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class CustomThreadPoolExecutor implements CustomExecutor {
+    private static final Logger logger = LoggerFactory.getLogger(CustomThreadPoolExecutor.class);
     private final int corePoolSize;
     private final int maxPoolSize;
     private final long keepAliveTime;
@@ -37,6 +41,8 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
             throw new RejectedExecutionException("Пул потоков закрыт. Новые задачи не принимаются.");
         }
         int index = queueIndex.getAndUpdate(i -> (i + 1) % taskQueues.length);
+        logger.info("[Pool] Постановка задачи в очередь #{}", index);
+
         if (!taskQueues[index].offer(command)) {
             handleTaskRejection(command);
         } else {
@@ -64,6 +70,10 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
         }
     }
 
+    private void handleTaskRejection(Runnable command) {
+        logger.error("[Rejected] Задача была отклонена из-за перегрузки: {}", command);
+    }
+
     private synchronized void manageThreads() {
         if (currentPoolSize.get() < corePoolSize
                 || (currentPoolSize.get() < maxPoolSize && !allQueuesEmpty())
@@ -71,14 +81,17 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
             Thread worker = threadFactory.newThread(this::workerTask);
             worker.start();
             currentPoolSize.incrementAndGet();
+            logger.info("[Pool] Создан новый поток. Текущее количество потоков: {}", currentPoolSize.get());
         }
     }
 
     private void workerTask() {
+        final String threadName = Thread.currentThread().getName();
         try {
             while (!isShutdown || !allQueuesEmpty()) {
                 Runnable task = pollFromQueues();
                 if (task != null) {
+                    logger.info("[Worker] {} выполняет задачу.", threadName);
                     task.run();
                 } else if (currentPoolSize.get() > corePoolSize) {
                     break;
@@ -86,8 +99,10 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            logger.warn("[Worker] {} был прерван.", threadName);
         } finally {
             currentPoolSize.decrementAndGet();
+            logger.info("[Worker] {} завершён. Текущее количество потоков: {}", threadName, currentPoolSize.get());
         }
     }
 
@@ -98,6 +113,8 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
                 return task;
             }
         }
+        logger.info("[Worker] {} не получил задачу за {} {} и завершится.", 
+                    Thread.currentThread().getName(), keepAliveTime, timeUnit);
         return null;
     }
 
@@ -122,7 +139,4 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
         return totalCapacity;
     }
 
-    private void handleTaskRejection(Runnable command) {
-        System.out.println("[Отклонено] Задача была отклонена из-за перегрузки!");
-    }
 }
